@@ -20,6 +20,9 @@
 package org.apache.directory.server.core.authn;
 
 
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
 import javax.naming.Context;
 
 import org.apache.commons.collections4.map.LRUMap;
@@ -30,6 +33,7 @@ import org.apache.directory.api.ldap.model.entry.Entry;
 import org.apache.directory.api.ldap.model.entry.Value;
 import org.apache.directory.api.ldap.model.exception.LdapAuthenticationException;
 import org.apache.directory.api.ldap.model.exception.LdapException;
+import org.apache.directory.api.ldap.model.exception.LdapInvalidAttributeValueException;
 import org.apache.directory.api.ldap.model.name.Dn;
 import org.apache.directory.api.ldap.model.password.PasswordUtil;
 import org.apache.directory.server.core.api.DirectoryService;
@@ -75,6 +79,9 @@ public class SimpleAuthenticator extends AbstractAuthenticator
      * We will use a LRU cache for this purpose.
      */
     private final LRUMap credentialCache;
+
+    /** The attribute holding the user's otpauth TOTP URI (draft-andesco-otpauth-uri-00) */
+    public static final String TOTP_URI_AT = "otpAuthUri";
 
     /** Declare a default for this cache. 100 entries seems to be enough */
     private static final int DEFAULT_CACHE_SIZE = 100;
@@ -205,6 +212,10 @@ public class SimpleAuthenticator extends AbstractAuthenticator
 
         LdapPrincipal principal = getStoredPassword( bindContext );
 
+        // If the account has a TOTP URI, the credentials are <totp-code><password>.
+        // The code is verified first, then the remainder is checked as the password.
+        credentials = verifyAndStripTotp( bindContext, credentials );
+
         setAddresses( bindContext, principal );
 
         // Get the stored password, either from cache or from backend
@@ -246,6 +257,63 @@ public class SimpleAuthenticator extends AbstractAuthenticator
         throw new LdapAuthenticationException( message );
     }
 
+
+    /**
+     * Verifies the TOTP prefix of the credentials when the user entry defines a TOTP URI.
+     * If it does not, the credentials are returned untouched.
+     *
+     * @return the credentials without the TOTP prefix
+     * @throws LdapAuthenticationException if the TOTP is wrong, or the stored URI is unusable (fail closed)
+     */
+    private byte[] verifyAndStripTotp( BindOperationContext bindContext, byte[] credentials ) throws LdapException
+    {
+        Entry entry = bindContext.getEntry();
+
+        if ( entry == null )
+        {
+            // The principal came from the cache: load the entry (the TOTP URI is never cached)
+            lookupUserPassword( bindContext );
+            entry = bindContext.getEntry();
+        }
+
+        Attribute totpAttr = ( entry == null ) ? null : entry.get( TOTP_URI_AT );
+
+        if ( ( totpAttr == null ) || ( totpAttr.size() == 0 ) )
+        {
+            return credentials;
+        }
+
+        String message = I18n.err( I18n.ERR_14004_INCORRECT_PASSWORD, bindContext.getDn().getName() );
+        TotpVerifier verifier;
+
+        try
+        {
+            verifier = TotpVerifier.parse( totpAttr.getString() );
+        }
+        catch ( IllegalArgumentException | LdapInvalidAttributeValueException e )
+        {
+            LOG.error( "{}: unusable {} value, rejecting bind", bindContext.getDn(), TOTP_URI_AT );
+            throw new LdapAuthenticationException( message );
+        }
+
+        int digits = verifier.getDigits();
+
+        if ( ( credentials == null ) || ( credentials.length <= digits ) )
+        {
+            LOG.info( message );
+            throw new LdapAuthenticationException( message );
+        }
+
+        String code = new String( credentials, 0, digits, StandardCharsets.US_ASCII );
+
+        if ( !verifier.verify( code, getDirectoryService().getTimeProvider().currentIimeMillis() ) )
+        {
+            LOG.info( message );
+            throw new LdapAuthenticationException( message );
+        }
+
+        return Arrays.copyOfRange( credentials, digits, credentials.length );
+    }
 
     /**
      * Local function which request the password from the backend
